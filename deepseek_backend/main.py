@@ -21,12 +21,12 @@ def home():
 # Enable CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=["http://localhost:8501", "http://localhost:8502", "http://localhost:8503"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Base URL for DeepSeek API
+# Base URL for DeepSeek API (ensure this is correct)
 BASE_URL = "http://127.0.0.1:11434/api"
 
 def generate_sql_prompt(schema_info, question, history):
@@ -35,17 +35,18 @@ def generate_sql_prompt(schema_info, question, history):
     """
     prompt = f"""You are a SQL expert. Generate SQL queries based on this database schema:
 
-   Schema:
-   {schema_info}
+Schema:
+{schema_info}
 
-   Previous conversation:
-   {history}
+Previous conversation:
+{history}
 
-   Question: {question}
+Question: {question}
 
-   Output ONLY the SQL query without any explanations. Make sure to use proper JOINs and WHERE clauses as needed.
-   Do not enclose table names in single quotes.
-   """
+Output ONLY the SQL query without any explanations. Make sure to use proper JOINs and WHERE clauses as needed.
+Do not enclose table names in single quotes.
+Make sure the SQL syntax is correct for PostgreSQL. When counting unique values, use the syntax: COUNT(DISTINCT column_name).
+"""
     return prompt
 
 def extract_sql_query(response_text):
@@ -56,21 +57,17 @@ def extract_sql_query(response_text):
     (i.e. starting with SELECT or WITH and containing a FROM clause). If found, it
     returns that line (appending a semicolon if missing).
     """
-    # Updated regex pattern to allow optional quotes (single or double) around the table name.
     pattern = re.compile(
         r"^(SELECT|WITH)\s+.*\s+FROM\s+['\"]?[\w\.]+['\"]?",
         re.IGNORECASE | re.DOTALL
     )
-    # Split the response into lines and check each line.
     lines = response_text.splitlines()
     for line in lines:
         candidate = line.strip()
         if pattern.match(candidate):
-            # Optionally, ensure it ends with a semicolon.
             if not candidate.endswith(";"):
                 candidate += ";"
             return candidate
-    # If no valid SQL query is found, raise an error.
     raise HTTPException(status_code=500, detail="DeepSeek returned an invalid SQL query.")
 
 @app.post("/chat")
@@ -106,8 +103,8 @@ async def chat_endpoint(request: ChatRequest):
             request.chat_history
         )
 
-        # Set a custom timeout value (300 seconds total, 60 seconds for connect)
-        timeout = httpx.Timeout(300.0, connect=60.0)
+        # Set a custom timeout value (300 seconds total, 60 seconds for connect, 300 for read)
+        timeout = httpx.Timeout(600.0, connect=180.0, read=300.0)
 
         # Request SQL query from DeepSeek
         async with httpx.AsyncClient(timeout=timeout) as client:
@@ -120,14 +117,12 @@ async def chat_endpoint(request: ChatRequest):
                 }
             )
 
-        # Debugging: Print DeepSeek response details
+        # Debug: Print DeepSeek response details
         print("🔹 DeepSeek Response Status Code:", deepseek_response.status_code)
         print("🔹 DeepSeek Response Text:", deepseek_response.text)
 
-        # Raise for HTTP errors
         deepseek_response.raise_for_status()
 
-        # Parse JSON response
         try:
             deepseek_data = deepseek_response.json()
         except Exception as e:
@@ -140,18 +135,21 @@ async def chat_endpoint(request: ChatRequest):
         if "response" not in deepseek_data:
             raise HTTPException(status_code=500, detail="Invalid API response - missing 'response' key.")
 
-        # Extract valid SQL query using the extraction function
         raw_query = deepseek_data["response"].strip()
         sql_query = extract_sql_query(raw_query)
         print("📝 Extracted SQL Query:", sql_query)
 
         # Execute the SQL query in the database.
-        # NOTE: We pass the SQL query as a string, not wrapped in text(), to avoid type issues.
         result = db_manager.execute_query(sql_query)
         print("📊 Query Result:", result)
 
-        # Generate a summary prompt for DeepSeek
-        summary_prompt = f"Summarize these results: {str(result[:3])}"
+        # Prepare a preview for the summary prompt safely.
+        if isinstance(result, list):
+            preview_result = result[:3]
+        else:
+            preview_result = result
+
+        summary_prompt = f"Summarize these results: {str(preview_result)}"
         async with httpx.AsyncClient(timeout=timeout) as client:
             summary_response = await client.post(
                 f"{BASE_URL}/generate",
@@ -162,7 +160,6 @@ async def chat_endpoint(request: ChatRequest):
                 }
             )
 
-        # Debugging: Print summary response details
         print("🔹 Summary Response Status Code:", summary_response.status_code)
         print("🔹 Summary Response Text:", summary_response.text)
         summary_response.raise_for_status()
@@ -171,13 +168,8 @@ async def chat_endpoint(request: ChatRequest):
         if "response" not in summary_data:
             raise HTTPException(status_code=500, detail="Summary generation failed - invalid response format.")
 
-        # Extract the useful part of the summary
         raw_summary = summary_data["response"].strip()
-
-        # Remove "<think>...</think>" blocks if present
         clean_summary = re.sub(r"<think>.*?</think>", "", raw_summary, flags=re.DOTALL).strip()
-
-        # Ensure the summary is clean
         summary = clean_summary if clean_summary else "Summary not available."
 
         return {
